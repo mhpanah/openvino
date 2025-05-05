@@ -65,6 +65,8 @@ void MHABase::SetUp() {
 #endif
     if (inType == ov::element::bf16)
         rel_threshold = 0.05f;
+    if (inType == ov::element::f16)
+        abs_threshold = 2e-2;
  }
 
 std::string MHA::getTestCaseName(testing::TestParamInfo<ov::test::snippets::MHAParams> obj) {
@@ -151,6 +153,21 @@ std::shared_ptr<SnippetsFunctionBase> MHA::get_subgraph() const {
     return std::make_shared<ov::test::snippets::MHAFunction>(inputDynamicShapes, m_input_types, m_with_mul, is_with_reshape);
 }
 
+std::shared_ptr<SnippetsFunctionBase> MHA2D::get_subgraph() const {
+    return std::make_shared<ov::test::snippets::MHA2DFunction>(inputDynamicShapes, m_input_types);
+}
+
+void MHA::init_thresholds() {
+    MHABase::init_thresholds();
+    auto precision_hint = configuration.count(ov::hint::inference_precision.name())
+                              ? configuration.at(ov::hint::inference_precision.name())
+                              : ov::element::f32;
+    if (m_input_types.size() > 1 && m_input_types[0] == ov::element::bf16 && precision_hint == ov::element::f32) {
+        rel_threshold = 0.01f;
+        abs_threshold = 0.0078125f;
+    }
+}
+
 void MHASelect::generate_inputs(const std::vector<ov::Shape>& targetInputStaticShapes) {
     inputs.clear();
     auto model_inputs = function->inputs();
@@ -232,11 +249,21 @@ std::shared_ptr<SnippetsFunctionBase> MHAWithExtractedReshape::get_subgraph() co
     return std::make_shared<ov::test::snippets::MHAWithExtractedReshapeFunction>(inputDynamicShapes, false);
 }
 
+std::shared_ptr<SnippetsFunctionBase> MHARankUpgradeToReductionReshape::get_subgraph() const {
+    return std::make_shared<ov::test::snippets::MHARankUpgradeToReductionFunction>(inputDynamicShapes);
+}
+
 std::shared_ptr<SnippetsFunctionBase> MHAWithDynamicMul::get_subgraph() const {
     return std::make_shared<ov::test::snippets::MHAWithDynamicMulFunction>(inputDynamicShapes, m_input_types);
 }
 
 TEST_P(MHA, CompareWithRefImpl) {
+    SKIP_IF_CURRENT_TEST_IS_DISABLED()
+    run();
+    validateNumSubgraphs();
+}
+
+TEST_P(MHA2D, CompareWithRefImpl) {
     SKIP_IF_CURRENT_TEST_IS_DISABLED()
     run();
     validateNumSubgraphs();
@@ -298,6 +325,12 @@ TEST_P(MHAFQ, CompareWithRefImpl) {
 }
 
 TEST_P(MHAWithExtractedReshape, CompareWithRefImpl) {
+    SKIP_IF_CURRENT_TEST_IS_DISABLED()
+    run();
+    validateNumSubgraphs();
+}
+
+TEST_P(MHARankUpgradeToReductionReshape, CompareWithRefImpl) {
     SKIP_IF_CURRENT_TEST_IS_DISABLED()
     run();
     validateNumSubgraphs();

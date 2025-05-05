@@ -20,6 +20,14 @@ namespace opt {
 
 void Context::permute(PPtr orig_param, const Context::Axes& order) {
     closures_to_permute[orig_param] = order;
+
+    const auto& orig_shape = orig_param->get_shape();
+    ov::Shape tw_shape;
+    for (const auto& axis : order) {
+        tw_shape.push_back(orig_shape[axis]);
+    }
+    orig_param->set_partial_shape(tw_shape);
+    orig_param->validate_and_infer_types();
 }
 
 void Context::to_f16(PPtr orig_param) {
@@ -126,7 +134,7 @@ namespace uat = ov::npuw::util::at;
 //     Param/Const(S) -> (Reshape) -> (to(f32)) -> Reshape -->
 //
 
-DQMatMulCWi::DQMatMulCWi() {
+DQMatMulCWi::DQMatMulCWi(Context::Ref ctx) {
     auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
     auto qcoeff = opp::any_input();
     auto reshapew = opp::optional<ov::op::v1::Reshape>({qweight, opp::any_input()});
@@ -152,14 +160,23 @@ DQMatMulCWi::DQMatMulCWi() {
         auto qcoeff_shape = matched_node_qcoeff->output(0).get_shape();
 
         if ((ov::element::i4 == matched_qweight->get_element_type() ||
-             ov::element::i8 == matched_qweight->get_element_type()) &&
+             ov::element::i8 == matched_qweight->get_element_type() ||
+             ov::element::nf4 == matched_qweight->get_element_type()) &&
             (ov::op::util::is_parameter(matched_node_qcoeff) || ov::op::util::is_constant(matched_node_qcoeff)) &&
             qcoeff_shape[1] == 1 && !matched_matmul->get_transpose_a() && matched_matmul->get_transpose_b()) {
             auto matched_node_cvtw = node_to_output.at(qcvtw).get_node_shared_ptr();
             auto matched_node_muls = node_to_output.at(qmuls).get_node_shared_ptr();
             auto matched_node_mmi = node_to_output.at(qmmi).get_node_shared_ptr();
-            auto matched_node_qcoeff_out = uat::_(node_to_output).at_or_at_or_at(qcvtc, reshapec, qcoeff);
-            auto matched_node_muls_out = uat::_(node_to_output).at_or_at(qcvtm, qmuls);
+            auto& matched_node_qcoeff_out = uat::_(node_to_output).at_or_at_or_at(qcvtc, reshapec, qcoeff);
+            auto& matched_node_muls_out = uat::_(node_to_output).at_or_at(qcvtm, qmuls);
+
+            if (!ctx.get().mm_dq_full) {
+                const auto& matm_mul_out_shape = matched_matmul->get_output_shape(0);
+                const auto& matm_mul_in_shape = matched_matmul->get_input_shape(1);
+                NPUW_ASSERT(matm_mul_out_shape.back() == matm_mul_in_shape.front());
+                NPUW_ASSERT(matched_matmul->get_transpose_b());
+                return false;  // root hasn't changed
+            }
 
             // Reconnect MatMul to read from Convert(W) directly.
             // Note: ACT has to be converted too.
@@ -238,7 +255,9 @@ DQMatMulGQi::DQMatMulGQi(Context::Ref ctx) {
 
         auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
         auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
+        auto matched_node_qmuls = node_to_output.at(qmuls).get_node_shared_ptr();
         auto matched_node_matmul = node_to_output.at(qmm).get_node_shared_ptr();
+        auto matched_node_qreshp = node_to_output.at(qreshp).get_node_shared_ptr();
         auto matched_out_mmi = node_to_output.at(qmmi);
 
         auto matched_qweight = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qweight);
@@ -255,10 +274,36 @@ DQMatMulGQi::DQMatMulGQi(Context::Ref ctx) {
             act_shape.size() == 3 && act_shape[1] == 1 &&  // single-token case
             qcoeff_shape[0] == qweight_shape[0] && qcoeff_shape[1] == 1 && qcoeff_shape[2] == qweight_shape[2] &&
             !matched_matmul->get_transpose_a() && !matched_matmul->get_transpose_b()) {
+            if (!ctx.get().mm_dq_full) {
+                // Transpose weight and coeff
+                ctx.get().permute(matched_qweight, {0, 2, 1});
+                ctx.get().permute(matched_qcoeff, {0, 2, 1});
+
+                // Add Transpose and insert it
+                std::vector<std::size_t> new_transpose_order = {1, 0, 2};
+                auto new_transpose_order_c =
+                    std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, new_transpose_order);
+                auto new_transpose = std::make_shared<ov::op::v1::Transpose>(matched_node_qmuls, new_transpose_order_c);
+                matched_node_qreshp->input(0).replace_source_output(new_transpose);
+                matched_node_qreshp->validate_and_infer_types();
+
+                // Change Reshape's shape
+                std::vector<std::size_t> transposed_shape = {qweight_shape[2], qweight_shape[0] * qweight_shape[1]};
+                auto transposed_shape_c =
+                    std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{2}, transposed_shape);
+                matched_node_qreshp->input(1).replace_source_output(transposed_shape_c);
+                matched_node_qreshp->validate_and_infer_types();
+
+                matched_matmul->set_transpose_b(true);
+                matched_matmul->validate_and_infer_types();
+
+                const auto& matm_mul_out_shape = matched_matmul->get_output_shape(0);
+                const auto& matm_mul_in_shape = matched_matmul->get_input_shape(1);
+                NPUW_ASSERT(matm_mul_out_shape.back() == matm_mul_in_shape.front());
+                return false;  // root hasn't changed
+            }
+
             // Mark W closure to transpose, and transpose the respective parameter
-            ov::Shape tw_shape = {qweight_shape[0], qweight_shape[2], qweight_shape[1]};
-            matched_qweight->set_partial_shape(tw_shape);
-            matched_qweight->validate_and_infer_types();
             ctx.get().permute(matched_qweight, {0, 2, 1});
 
             // Mark S closure to be lowered fo f16
@@ -342,7 +387,8 @@ DQMatMulGQ2i::DQMatMulGQ2i(Context::Ref ctx) {
     auto qcoeff = opp::wrap_type<ov::op::v0::Parameter>();
     auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
     auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qcvtw, qcoeff});
-    auto qreshp = opp::wrap_type<ov::op::v1::Reshape>({qmuls, opp::any_input()});
+    auto qcvtm = opp::optional<ov::op::v0::Convert>({qmuls->output(0)});
+    auto qreshp = opp::wrap_type<ov::op::v1::Reshape>({qcvtm, opp::any_input()});
     auto qcvtr = opp::optional<ov::op::v0::Convert>({qreshp->output(0)});
     auto qmmi = opp::any_input();
     auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtr});
@@ -353,7 +399,13 @@ DQMatMulGQ2i::DQMatMulGQ2i(Context::Ref ctx) {
 
         auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
         auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
+        auto matched_node_qmuls = node_to_output.at(qmuls).get_node_shared_ptr();
+        std::shared_ptr<Node> matched_node_qcvtm = nullptr;
+        if (node_to_output.count(qcvtm)) {
+            matched_node_qcvtm = node_to_output.at(qcvtm).get_node_shared_ptr();
+        }
         auto matched_node_matmul = node_to_output.at(qmm).get_node_shared_ptr();
+        auto matched_node_qreshp = node_to_output.at(qreshp).get_node_shared_ptr();
         auto matched_out_mmi = node_to_output.at(qmmi);
 
         auto matched_qweight = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qweight);
@@ -370,19 +422,35 @@ DQMatMulGQ2i::DQMatMulGQ2i(Context::Ref ctx) {
             act_shape.size() == 3 && act_shape[0] == 1 && act_shape[1] == 1 && qcoeff_shape[0] == qweight_shape[0] &&
             qcoeff_shape[2] == 1 && qcoeff_shape[1] == qweight_shape[1] && !matched_matmul->get_transpose_a() &&
             matched_matmul->get_transpose_b()) {
+            if (!ctx.get().mm_dq_full) {
+                // Transpose weight and coeff
+                ctx.get().permute(matched_qweight, {1, 0, 2});
+                ctx.get().permute(matched_qcoeff, {1, 0, 2});
+
+                // Add Transpose and insert it
+                std::vector<std::size_t> new_transpose_order = {1, 0, 2};
+                auto new_transpose_order_c =
+                    std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, new_transpose_order);
+                auto new_transpose = std::make_shared<ov::op::v1::Transpose>(matched_node_qmuls, new_transpose_order_c);
+                if (matched_node_qcvtm) {
+                    new_transpose = std::make_shared<ov::op::v1::Transpose>(matched_node_qcvtm, new_transpose_order_c);
+                }
+                matched_node_qreshp->input(0).replace_source_output(new_transpose);
+                matched_node_qreshp->validate_and_infer_types();
+                matched_matmul->validate_and_infer_types();
+
+                const auto& matm_mul_out_shape = matched_matmul->get_output_shape(0);
+                const auto& matm_mul_in_shape = matched_matmul->get_input_shape(1);
+                NPUW_ASSERT(matm_mul_out_shape.back() == matm_mul_in_shape.front());
+                NPUW_ASSERT(matched_matmul->get_transpose_b());
+                return false;  // root hasn't changed
+            }
+
             // Mark W closure to transpose, and transpose the respective parameter
             ctx.get().permute(matched_qweight, {1, 0, 2});
 
-            ov::Shape tw_shape = {qweight_shape[1], qweight_shape[0], qweight_shape[2]};
-            matched_qweight->set_partial_shape(tw_shape);
-            matched_qweight->validate_and_infer_types();
-
             // Also transpose S, but in a different way (see diagram above)
             ctx.get().permute(matched_qcoeff, {1, 2, 0});
-
-            ov::Shape ts_shape = {qcoeff_shape[1], qcoeff_shape[2], qcoeff_shape[0]};
-            matched_qcoeff->set_partial_shape(ts_shape);
-            matched_qcoeff->validate_and_infer_types();
 
             // Reshape the Act to group format
             const auto NSPLIT = qweight_shape[1];
@@ -473,7 +541,9 @@ DQMatMulGQiP::DQMatMulGQiP(Context::Ref ctx) {
 
         auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
         auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
+        auto matched_node_qmuls = node_to_output.at(qmuls).get_node_shared_ptr();
         auto matched_node_matmul = node_to_output.at(qmm).get_node_shared_ptr();
+        auto matched_node_qreshp = node_to_output.at(qreshp).get_node_shared_ptr();
         auto matched_out_mmi = node_to_output.at(qmmi);
 
         auto matched_qweight = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qweight);
@@ -489,15 +559,39 @@ DQMatMulGQiP::DQMatMulGQiP(Context::Ref ctx) {
             act_shape.size() == 3 && act_shape[1] > 1 &&  // multi-token case
             qcoeff_shape[0] == qweight_shape[0] && qcoeff_shape[1] == 1 && qcoeff_shape[2] == qweight_shape[2] &&
             !matched_matmul->get_transpose_a() && !matched_matmul->get_transpose_b()) {
+            if (!ctx.get().mm_dq_full) {
+                // Transpose weight and coeff
+                ctx.get().permute(matched_qweight, {0, 2, 1});
+                ctx.get().permute(matched_qcoeff, {0, 2, 1});
+
+                // Add Transpose and insert it
+                std::vector<std::size_t> new_transpose_order = {1, 0, 2};
+                auto new_transpose_order_c =
+                    std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, new_transpose_order);
+                auto new_transpose = std::make_shared<ov::op::v1::Transpose>(matched_node_qmuls, new_transpose_order_c);
+                matched_node_qreshp->input(0).replace_source_output(new_transpose);
+                matched_node_qreshp->validate_and_infer_types();
+
+                // // Change Reshape's shape
+                std::vector<std::size_t> transposed_shape = {qweight_shape[2], qweight_shape[0] * qweight_shape[1]};
+                auto transposed_shape_c =
+                    std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{2}, transposed_shape);
+                matched_node_qreshp->input(1).replace_source_output(transposed_shape_c);
+                matched_node_qreshp->validate_and_infer_types();
+
+                matched_matmul->set_transpose_b(true);
+                matched_matmul->validate_and_infer_types();
+
+                const auto& matm_mul_out_shape = matched_matmul->get_output_shape(0);
+                const auto& matm_mul_in_shape = matched_matmul->get_input_shape(1);
+                NPUW_ASSERT(matm_mul_out_shape.back() == matm_mul_in_shape.front());
+                return false;  // root hasn't changed
+            }
+
             // Mark W closure to transpose, and transpose the respective parameter
-            ov::Shape tw_shape = {qweight_shape[0], qweight_shape[2], qweight_shape[1]};
-            matched_qweight->set_partial_shape(tw_shape);
-            matched_qweight->validate_and_infer_types();
             ctx.get().permute(matched_qweight, {0, 2, 1});
 
             // Mark S closure to be lowered fo f16
-            matched_qcoeff->set_element_type(ov::element::f16);
-            matched_qcoeff->validate_and_infer_types();
             ctx.get().to_f16(matched_qcoeff);
 
             // Reshape the Act to group format
@@ -575,10 +669,11 @@ DQMatMulGQ2iP::DQMatMulGQ2iP(Context::Ref ctx) {
     auto qcoeff = opp::wrap_type<ov::op::v0::Parameter>();
     auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
     auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qcvtw, qcoeff});
-    auto qreshp = opp::wrap_type<ov::op::v1::Reshape>({qmuls, opp::any_input()});
-    auto qcvtm = opp::optional<ov::op::v0::Convert>({qreshp->output(0)});
+    auto qcvtm = opp::optional<ov::op::v0::Convert>({qmuls->output(0)});
+    auto qreshp = opp::wrap_type<ov::op::v1::Reshape>({qcvtm, opp::any_input()});
+    auto qcvtr = opp::optional<ov::op::v0::Convert>({qreshp->output(0)});
     auto qmmi = opp::any_input();
-    auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtm});
+    auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtr});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
     auto callback = [=](ov::pass::pattern::Matcher& m) {
@@ -586,7 +681,13 @@ DQMatMulGQ2iP::DQMatMulGQ2iP(Context::Ref ctx) {
 
         auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
         auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
+        auto matched_node_qmuls = node_to_output.at(qmuls).get_node_shared_ptr();
+        std::shared_ptr<Node> matched_node_qcvtm = nullptr;
+        if (node_to_output.count(qcvtm)) {
+            matched_node_qcvtm = node_to_output.at(qcvtm).get_node_shared_ptr();
+        }
         auto matched_node_matmul = node_to_output.at(qmm).get_node_shared_ptr();
+        auto matched_node_qreshp = node_to_output.at(qreshp).get_node_shared_ptr();
         auto matched_out_mmi = node_to_output.at(qmmi);
 
         auto matched_qweight = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qweight);
@@ -606,18 +707,35 @@ DQMatMulGQ2iP::DQMatMulGQ2iP(Context::Ref ctx) {
             act_shape.size() == 3 && just_one(act_shape[0], act_shape[1]) &&  // multi-token case
             qcoeff_shape[0] == qweight_shape[0] && qcoeff_shape[1] == qweight_shape[1] && qcoeff_shape[2] == 1 &&
             !matched_matmul->get_transpose_a() && matched_matmul->get_transpose_b()) {
+            if (!ctx.get().mm_dq_full) {
+                // Transpose weight and coeff
+                ctx.get().permute(matched_qweight, {1, 0, 2});
+                ctx.get().permute(matched_qcoeff, {1, 0, 2});
+
+                // Add Transpose and insert it
+                std::vector<std::size_t> new_transpose_order = {1, 0, 2};
+                auto new_transpose_order_c =
+                    std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{3}, new_transpose_order);
+                auto new_transpose = std::make_shared<ov::op::v1::Transpose>(matched_node_qmuls, new_transpose_order_c);
+                if (matched_node_qcvtm) {
+                    new_transpose = std::make_shared<ov::op::v1::Transpose>(matched_node_qcvtm, new_transpose_order_c);
+                }
+                matched_node_qreshp->input(0).replace_source_output(new_transpose);
+                matched_node_qreshp->validate_and_infer_types();
+                matched_matmul->validate_and_infer_types();
+
+                const auto& matm_mul_out_shape = matched_matmul->get_output_shape(0);
+                const auto& matm_mul_in_shape = matched_matmul->get_input_shape(1);
+                NPUW_ASSERT(matm_mul_out_shape.back() == matm_mul_in_shape.front());
+                NPUW_ASSERT(matched_matmul->get_transpose_b());
+                return false;  // root hasn't changed
+            }
+
             // Mark W closure to transpose, and transpose the respective parameter
-            ov::Shape tw_shape = {qweight_shape[1], qweight_shape[0], qweight_shape[2]};
-            matched_qweight->set_partial_shape(tw_shape);
-            matched_qweight->validate_and_infer_types();
             ctx.get().permute(matched_qweight, {1, 0, 2});
 
             // Also transpose S, but in a different way (see diagram above)
             ctx.get().permute(matched_qcoeff, {1, 2, 0});
-
-            ov::Shape ts_shape = {qcoeff_shape[1], qcoeff_shape[2], qcoeff_shape[0]};
-            matched_qcoeff->set_partial_shape(ts_shape);
-            matched_qcoeff->validate_and_infer_types();
 
             // Select proper activation shape
             std::size_t act_dim = act_shape[0] > act_shape[1] ? 0 : 1;
@@ -697,7 +815,8 @@ DQParMMGQ::DQParMMGQ(Context::Ref ctx) {
     auto qreshp = opp::wrap_type<ov::op::v1::Reshape>({qmuls, opp::any_input()});
     auto qmmi = opp::wrap_type<ov::op::v1::Multiply>({opp::any_input(), opp::any_input()});
     auto qcvtr = opp::optional<ov::op::v0::Convert>({qreshp->output(0)});
-    auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtr});
+    auto qcvtm = opp::optional<ov::op::v0::Convert>({qmmi->output(0)});
+    auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qcvtm, qcvtr});
 
     // Note: Use [=] to make sure the above objects stay alive in the callback
     auto callback = [=](ov::pass::pattern::Matcher& m) {
@@ -873,7 +992,7 @@ DQLiftGatherSymCW::DQLiftGatherSymCW() {
     auto qcoeff = opp::wrap_type<ov::op::v0::Constant>();
     auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
     auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qcvtw, qcoeff});
-    auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
+    auto qcvtm = opp::optional<ov::op::v0::Convert>({qmuls->output(0)});
 
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
     auto cvtids = opp::optional<ov::op::v0::Convert>({pids->output(0)});
@@ -892,14 +1011,35 @@ DQLiftGatherSymCW::DQLiftGatherSymCW() {
         auto new_cvt_w = std::make_shared<ov::op::v0::Convert>(matched_out_w, ov::element::f16);
         auto gather_c = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{}, 0);
         auto new_g_w = std::make_shared<ov::op::v8::Gather>(new_cvt_w, matched_out_ids, gather_c);
-        auto new_g_s = std::make_shared<ov::op::v8::Gather>(matched_out_s, matched_out_ids, gather_c);
-        auto new_mul = std::make_shared<ov::op::v1::Multiply>(new_g_w, new_g_s);
-        auto new_out = std::make_shared<ov::op::v0::Convert>(new_mul, ov::element::f32);
+        auto new_scale_out = matched_out_s;
 
+        if (matched_out_s.get_element_type() != ov::element::f16) {
+            new_scale_out = std::make_shared<ov::op::v0::Convert>(matched_out_s, ov::element::f16);
+        }
+
+        auto new_g_s = std::make_shared<ov::op::v8::Gather>(new_scale_out, matched_out_ids, gather_c);
+        auto new_mul = std::make_shared<ov::op::v1::Multiply>(new_g_w, new_g_s);
+
+        // Handle case with non-f16 scale
+        if (matched_out_s.get_element_type() != ov::element::f16) {
+            auto new_out = std::make_shared<ov::op::v0::Convert>(new_mul, matched_out_s.get_element_type());
+
+            NPUW_ASSERT(node_to_output.find(qcvtm) == node_to_output.end());
+
+            // Reconnect old gather readers to the new Convert
+            for (auto&& r : matched_out_gather.get_target_inputs()) {
+                r.replace_source_output(new_out);
+            }
+
+            return true;  // root was changed
+        }
+
+        auto new_out = std::make_shared<ov::op::v0::Convert>(new_mul, ov::element::f32);
         // Reconnect old gather readers to the new Multiply
         for (auto&& r : matched_out_gather.get_target_inputs()) {
             r.replace_source_output(new_out);
         }
+
         return true;  // root was changed
     };
     register_matcher(std::make_shared<opp::Matcher>(gather, "DQGatherSymCW"), std::move(callback));
@@ -959,7 +1099,7 @@ DQLiftGatherSymGQ::DQLiftGatherSymGQ() {
 
 // This is a companion to DQLiftGatherAsymCW step. This pass runs if
 // the respective block (mainly, a head) was turned a function
-// (e.g. with FUNCALL_FOR_ALL) As in this case the DQDictMatMulCWu
+// (e.g. with FUNCALL_FOR_ALL) As in this case the DQUnpackDictMatMulCWu
 // compile-time converts asymmetric MM to fp16, do the same thing here
 DQUnpackDictGatheru::DQUnpackDictGatheru(Context::Ref ctx) {
     auto pids = opp::wrap_type<ov::op::v0::Parameter>();
@@ -1120,10 +1260,12 @@ HostGatherDQ::HostGatherDQ(Context::Ref ctx) {
 
     auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
     auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
+
     auto qcoeff = opp::wrap_type<ov::op::v0::Parameter>();
+    auto qcvtc = opp::optional<ov::op::v0::Convert>({qcoeff->output(0)});
 
     auto qgthrw = opp::wrap_type<ov::op::v8::Gather>({qcvtw, cvtids, opp::any_input()});
-    auto qgthrc = opp::wrap_type<ov::op::v8::Gather>({qcoeff, cvtids, opp::any_input()});
+    auto qgthrc = opp::wrap_type<ov::op::v8::Gather>({qcvtc, cvtids, opp::any_input()});
     auto qmul = opp::wrap_type<ov::op::v1::Multiply>({qgthrw, qgthrc});
 
     auto callback = [=](ov::pass::pattern::Matcher& m) {
@@ -1143,7 +1285,9 @@ HostGatherDQ::HostGatherDQ(Context::Ref ctx) {
         const auto& matched_out_qweight = node_to_output.at(qweight);
         auto qweight_type = matched_out_qweight.get_element_type();
 
-        if (out_len >= 2048 && (qweight_type == ov::element::i4 || qweight_type == ov::element::i8)) {
+        if (out_len >= 2048 && (qweight_type == ov::element::i4 || qweight_type == ov::element::i8 ||
+                                qweight_type == ov::element::f8e4m3 || qweight_type == ov::element::f8e5m2 ||
+                                qweight_type == ov::element::f8e8m0)) {
             auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
             auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
             auto matched_node_ids = node_to_output.at(pids).get_node_shared_ptr();
@@ -1217,10 +1361,68 @@ DQUnpackDictMatMulCWu::DQUnpackDictMatMulCWu(Context::Ref ctx) {
             auto new_out = std::make_shared<ov::op::v0::Convert>(new_mm, ov::element::f32);
 
             matched_result->input(0).replace_source_output(new_out);
+
+            return true;  // root was changed
         }
         return false;  // root has changed (yet)
     };
-    register_matcher(std::make_shared<opp::Matcher>(qres, "OptDQDictMatMulCWu"), std::move(callback));
+    register_matcher(std::make_shared<opp::Matcher>(qres, "OptDQUnpackDictMatMulCWu"), std::move(callback));
+}
+
+// FROM:
+//     Param(W) ---> to(f16) --->
+//     Param(S) ----------------> Multiply -> MatMul -> Result
+//     ???(Act) ---------------------------->
+//
+// TO:
+//     Param(W) -- to(f16) ->
+//     ???(Act) -> to(f16) -> MatMul -> to(f32) -> Result
+
+DQUnpackDictMatMulCWf8::DQUnpackDictMatMulCWf8(Context::Ref ctx) {
+    auto qweight = opp::wrap_type<ov::op::v0::Parameter>();
+    auto qcoeff = opp::wrap_type<ov::op::v0::Parameter>();
+    auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
+    auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qcvtw, qcoeff});
+    auto qmmi = opp::any_input();
+    auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qmuls});
+    auto qres = opp::wrap_type<ov::op::v0::Result>({qmm});
+
+    // Note: Use [=] to make sure the above objects stay alive in the callback
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+
+        auto matched_node_qweight = node_to_output.at(qweight).get_node_shared_ptr();
+        auto matched_node_cvtw = node_to_output.at(qcvtw).get_node_shared_ptr();
+        auto matched_node_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
+        auto matched_node_matmul = node_to_output.at(qmm).get_node_shared_ptr();
+        auto matched_mmi = node_to_output.at(qmmi);
+        auto matched_node_res = node_to_output.at(qres).get_node_shared_ptr();
+
+        auto matched_qweight = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qweight);
+        auto matched_qcoeff = std::static_pointer_cast<ov::op::v0::Parameter>(matched_node_qcoeff);
+        auto matched_matmul = std::static_pointer_cast<ov::op::v0::MatMul>(matched_node_matmul);
+        auto matched_result = std::static_pointer_cast<ov::op::v0::Result>(matched_node_res);
+
+        auto qcoeff_shape = matched_qcoeff->output(0).get_shape();
+
+        if ((ov::element::f8e4m3 == matched_qweight->get_element_type() ||
+             ov::element::f8e5m2 == matched_qweight->get_element_type() ||
+             ov::element::f8e8m0 == matched_qweight->get_element_type()) &&
+            qcoeff_shape[1] == 1 && !matched_matmul->get_transpose_a() && matched_matmul->get_transpose_b()) {
+            auto new_cvt_a = std::make_shared<ov::op::v0::Convert>(matched_mmi, ov::element::f16);
+
+            auto new_wi = ctx.get().unpack(matched_qweight, matched_qcoeff, ov::element::f16);
+
+            auto new_mm = std::make_shared<ov::op::v0::MatMul>(new_cvt_a, new_wi, false, true);
+            auto new_out = std::make_shared<ov::op::v0::Convert>(new_mm, matched_matmul->get_element_type());
+
+            matched_result->input(0).replace_source_output(new_out);
+
+            return true;  // root was changed
+        }
+        return false;  // root has changed (yet)
+    };
+    register_matcher(std::make_shared<opp::Matcher>(qres, "OptDQUnpackDictMatMulCWf8"), std::move(callback));
 }
 
 // FROM:
@@ -1273,6 +1475,8 @@ DQUnpackDictMatMulGQi::DQUnpackDictMatMulGQi(Context::Ref ctx) {
             auto new_out = std::make_shared<ov::op::v0::Convert>(new_mm, ov::element::f32);
 
             matched_result->input(0).replace_source_output(new_out);
+
+            return true;  // root was changed
         }
         return false;  // root has changed (yet)
     };
@@ -1331,7 +1535,7 @@ SliceLastMatmul::SliceLastMatmul() {
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
 
-        auto matched_out_matmul = node_to_output.at(matmul);
+        auto& matched_out_matmul = node_to_output.at(matmul);
 
         auto shape = matched_out_matmul.get_node()->input(0).get_shape();
 
@@ -1367,7 +1571,7 @@ SliceLastMatmulAdd::SliceLastMatmulAdd() {
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
 
-        auto matched_out_matmul = node_to_output.at(matmul);
+        auto& matched_out_matmul = node_to_output.at(matmul);
 
         auto shape = matched_out_matmul.get_node()->input(0).get_shape();
 
@@ -1403,7 +1607,7 @@ SliceLastMatmulTranspose::SliceLastMatmulTranspose() {
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
 
-        auto matched_out_matmul = node_to_output.at(matmul);
+        auto& matched_out_matmul = node_to_output.at(matmul);
 
         auto shape = matched_out_matmul.get_node()->input(0).get_shape();
 
@@ -1432,7 +1636,7 @@ SliceLastMatmulTranspose::SliceLastMatmulTranspose() {
 
 SliceLastMatmulMultiply::SliceLastMatmulMultiply() {
     auto matmul = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), opp::any_input()});
-    auto div = opp::wrap_type<ov::op::v1::Divide>({matmul, opp::any_input()});
+    auto div = opp::wrap_type<ov::op::v1::Multiply, ov::op::v1::Divide>({matmul, opp::any_input()});
     auto tanh = opp::wrap_type<ov::op::v0::Tanh>({div});
     auto multiply = opp::wrap_type<ov::op::v1::Multiply>({tanh, opp::any_input()});
     auto res = opp::wrap_type<ov::op::v0::Result>({multiply});
@@ -1441,7 +1645,7 @@ SliceLastMatmulMultiply::SliceLastMatmulMultiply() {
     auto callback = [=](ov::pass::pattern::Matcher& m) {
         auto& node_to_output = m.get_pattern_value_map();
 
-        auto matched_out_matmul = node_to_output.at(matmul);
+        auto& matched_out_matmul = node_to_output.at(matmul);
 
         auto shape = matched_out_matmul.get_node()->input(0).get_shape();
 

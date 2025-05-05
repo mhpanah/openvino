@@ -1,25 +1,23 @@
-// Copyright (C) 2018-2024 Intel Corporation
+// Copyright (C) 2018-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
 #include "plugin_compiler_adapter.hpp"
 
-#include <ze_graph_ext.h>
-
 #include <memory>
 #include <string>
 
+#include "graph.hpp"
 #include "intel_npu/common/device_helpers.hpp"
 #include "intel_npu/common/itt.hpp"
-#include "intel_npu/config/compiler.hpp"
+#include "intel_npu/config/options.hpp"
 #include "intel_npu/npu_private_properties.hpp"
 #include "intel_npu/utils/logger/logger.hpp"
 #include "intel_npu/utils/zero/zero_api.hpp"
 #include "intel_npu/utils/zero/zero_result.hpp"
+#include "openvino/runtime/make_tensor.hpp"
 #include "openvino/util/file_util.hpp"
 #include "openvino/util/shared_object.hpp"
-#include "plugin_graph.hpp"
-#include "ze_graph_ext_wrappers.hpp"
 
 namespace {
 std::shared_ptr<void> loadLibrary(const std::string& libpath) {
@@ -85,47 +83,70 @@ std::shared_ptr<IGraph> PluginCompilerAdapter::compile(const std::shared_ptr<con
     auto networkDesc = _compiler->compile(model, config);
     _logger.debug("compile end");
 
+    auto tensor =
+        ov::Tensor(ov::element::u8, ov::Shape{networkDesc.compiledNetwork.size()}, networkDesc.compiledNetwork.data());
+    auto impl = ov::get_tensor_impl(tensor);
+    std::shared_ptr<std::vector<uint8_t>> sharedCompiledNetwork =
+        std::make_shared<std::vector<uint8_t>>(std::move(networkDesc.compiledNetwork));
+    impl._so = std::move(sharedCompiledNetwork);
+    tensor = ov::make_tensor(impl);
+
+    auto modelBuffer = std::make_shared<ov::SharedBuffer<ov::Tensor>>(reinterpret_cast<char*>(tensor.data()),
+                                                                      tensor.get_byte_size(),
+                                                                      tensor);
+
+    auto blobPtr = std::make_unique<BlobContainerAlignedBuffer>(modelBuffer, 0, tensor.get_byte_size());
+
     ze_graph_handle_t graphHandle = nullptr;
 
     if (_zeGraphExt) {
-        // Depending on the config, we may get an error when trying to get the graph handle from the compiled network
+        // Depending on the config, we may get an error when trying to get the graph handle from the compiled
+        // network
         try {
-            graphHandle = _zeGraphExt->getGraphHandle(networkDesc.compiledNetwork);
+            graphHandle =
+                _zeGraphExt->getGraphHandle(*reinterpret_cast<const uint8_t*>(blobPtr->get_ptr()), blobPtr->size());
         } catch (...) {
             _logger.info("Failed to obtain the level zero graph handle. Inference requests for this model are not "
                          "allowed. Only exports are available");
         }
     }
 
-    return std::make_shared<PluginGraph>(_zeGraphExt,
-                                         _compiler,
-                                         _zeroInitStruct,
-                                         graphHandle,
-                                         std::move(networkDesc.metadata),
-                                         std::move(networkDesc.compiledNetwork),
-                                         config);
+    return std::make_shared<Graph>(_zeGraphExt,
+                                   _zeroInitStruct,
+                                   graphHandle,
+                                   std::move(networkDesc.metadata),
+                                   std::move(blobPtr),
+                                   config,
+                                   _compiler);
 }
 
-std::shared_ptr<IGraph> PluginCompilerAdapter::parse(std::vector<uint8_t> network, const Config& config) const {
+std::shared_ptr<IGraph> PluginCompilerAdapter::parse(std::unique_ptr<BlobContainer> blobPtr,
+                                                     const Config& config) const {
     OV_ITT_TASK_CHAIN(PARSE_BLOB, itt::domains::NPUPlugin, "PluginCompilerAdapter", "parse");
 
     _logger.debug("parse start");
+    std::vector<uint8_t> network(blobPtr->size());
+    network.assign(reinterpret_cast<const uint8_t*>(blobPtr->get_ptr()),
+                   reinterpret_cast<const uint8_t*>(blobPtr->get_ptr()) + blobPtr->size());
     auto networkMeta = _compiler->parse(network, config);
+    network.clear();
+    network.shrink_to_fit();
     _logger.debug("parse end");
 
     ze_graph_handle_t graphHandle = nullptr;
 
     if (_zeGraphExt) {
-        graphHandle = _zeGraphExt->getGraphHandle(network);
+        graphHandle =
+            _zeGraphExt->getGraphHandle(*reinterpret_cast<const uint8_t*>(blobPtr->get_ptr()), blobPtr->size());
     }
 
-    return std::make_shared<PluginGraph>(_zeGraphExt,
-                                         _compiler,
-                                         _zeroInitStruct,
-                                         graphHandle,
-                                         std::move(networkMeta),
-                                         std::move(network),
-                                         config);
+    return std::make_shared<Graph>(_zeGraphExt,
+                                   _zeroInitStruct,
+                                   graphHandle,
+                                   std::move(networkMeta),
+                                   std::move(blobPtr),
+                                   config,
+                                   _compiler);
 }
 
 ov::SupportedOpsMap PluginCompilerAdapter::query(const std::shared_ptr<const ov::Model>& model,
@@ -133,6 +154,23 @@ ov::SupportedOpsMap PluginCompilerAdapter::query(const std::shared_ptr<const ov:
     OV_ITT_TASK_CHAIN(QUERY_BLOB, itt::domains::NPUPlugin, "PluginCompilerAdapter", "query");
 
     return _compiler->query(model, config);
+}
+
+uint32_t PluginCompilerAdapter::get_version() const {
+    // returning max val as PluginCompiler supports all features and options the plugin is aware of
+    return _compiler->get_version();
+}
+
+std::vector<std::string> PluginCompilerAdapter::get_supported_options() const {
+    // PluginCompiler has all the same options as plugin
+    // Returing empty string to let the plugin fallback to legacy registration
+    return {};
+}
+
+bool PluginCompilerAdapter::is_option_supported(std::string optname) const {
+    // This functions has no utility in PluginCompiler
+    // returning false for any request to avoid the option of spaming the plugin
+    return false;
 }
 
 }  // namespace intel_npu

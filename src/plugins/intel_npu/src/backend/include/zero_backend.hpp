@@ -1,4 +1,4 @@
-// Copyright (C) 2018-2024 Intel Corporation
+// Copyright (C) 2018-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -14,7 +14,7 @@
 namespace intel_npu {
 class ZeroEngineBackend final : public IEngineBackend {
 public:
-    ZeroEngineBackend(const Config& config);
+    ZeroEngineBackend();
     virtual ~ZeroEngineBackend();
     const std::shared_ptr<IDevice> getDevice() const override;
     const std::shared_ptr<IDevice> getDevice(const std::string&) const override;
@@ -25,15 +25,14 @@ public:
     uint32_t getDriverVersion() const override;
     uint32_t getGraphExtVersion() const override;
 
-    bool isBatchingSupported() const override;
     bool isCommandQueueExtSupported() const override;
     bool isLUIDExtSupported() const override;
-
-    const std::shared_ptr<ZeroInitStructsHolder>& getInitStruct() const;
 
     void* getContext() const override;
 
     void updateInfo(const Config& config) override;
+
+    const std::shared_ptr<ZeroInitStructsHolder> getInitStructs() const override;
 
 private:
     std::shared_ptr<ZeroInitStructsHolder> _initStruct;

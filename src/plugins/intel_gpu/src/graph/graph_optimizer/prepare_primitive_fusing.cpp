@@ -1,7 +1,7 @@
-// Copyright (C) 2018-2024 Intel Corporation
+// Copyright (C) 2018-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-
+#include "intel_gpu/runtime/debug_configuration.hpp"
 #include "program_helpers.h"
 #include "pass_manager.h"
 
@@ -16,6 +16,7 @@
 #include "gemm_inst.h"
 #include "lrn_inst.h"
 #include "mvn_inst.h"
+#include "rms_inst.h"
 #include "pooling_inst.h"
 #include "normalize_inst.h"
 #include "permute_inst.h"
@@ -37,6 +38,7 @@
 #include "strided_slice_inst.h"
 #include "cum_sum_inst.h"
 #include "embedding_bag_inst.h"
+#include "swiglu_inst.h"
 #include "extract_image_patches_inst.h"
 #include "reduce_inst.h"
 #include "group_normalization_inst.h"
@@ -54,8 +56,12 @@
 using namespace cldnn;
 
 void prepare_primitive_fusing::run(program& p) {
+    GPU_DEBUG_IF(p.get_config().get_disable_post_ops_fusions())
+        return;
+
     fuse_reorders(p);
     remove_redundant_reshape(p);
+    fuse_swiglu(p);
     fuse_bias(p);
     fuse_simple_primitives(p);
     fuse_constant_transposes(p);
@@ -161,6 +167,47 @@ void prepare_primitive_fusing::fuse_reorders(program &p) {
     }
 }
 
+void prepare_primitive_fusing::fuse_swiglu(program &p) {
+    bool disable_fc_swiglu_fusion = GPU_DEBUG_VALUE_OR(p.get_config().get_disable_fc_swiglu_fusion(), false);
+    // Apply only for high performant GPU
+    if (disable_fc_swiglu_fusion || p.get_engine().get_device_info().execution_units_count < 128)
+        return;
+
+    if (p.get_engine().get_device_info().supports_immad)
+        return;
+
+    // TODO: to support other glu types && other weight data types
+    auto itr = p.get_processing_order().begin();
+    std::map<primitive_id, std::vector<std::pair<primitive_id, size_t>>> fusing_history;
+    while (itr != p.get_processing_order().end()) {
+        auto node_itr = itr++;
+        auto& node = (*node_itr);
+        if (node->is_type<swiglu>()) {
+            if (!node->get_dependency(0).is_type<fully_connected>())
+                continue;
+            auto swiglu_prim = node->get_kernel_impl_params()->typed_desc<swiglu>();
+            auto& fc_node = node->get_dependency(0);
+            if (node->get_dependencies().size() > 1)
+                continue;
+            if (!fc_node.get_fused_primitives().empty())
+                continue;
+            auto in_dt = fc_node.get_input_layout(0).data_type;
+            if (in_dt != data_types::f16)
+                continue;
+            auto wt_dt = fc_node.get_input_layout(1).data_type;
+            if (!data_type_traits::is_i4_u4(wt_dt))
+                continue;
+            if (swiglu_prim->glu_type != ov::op::internal::GLU::GluType::Swish ||
+               !(swiglu_prim->axis == -1 || swiglu_prim->axis == static_cast<int64_t>(node->get_output_layout(0).get_partial_shape().size()) - 1))
+                continue;
+            GPU_DEBUG_TRACE_DETAIL << node->id() << " : fuse swiglu to " << fc_node.id() << std::endl;
+            GPU_DEBUG_TRACE_DETAIL << " - split axis : " << swiglu_prim->axis << std::endl;
+            GPU_DEBUG_TRACE_DETAIL << " - split length : " << swiglu_prim->split_lengths << std::endl;
+            p.fuse_nodes(fc_node, *node, &fusing_history);
+        }
+    }
+}
+
 void prepare_primitive_fusing::fuse_bias(program &p) {
     auto itr = p.get_processing_order().begin();
     while (itr != p.get_processing_order().end()) {
@@ -187,6 +234,17 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
 
         if (!is_bias_add)
             continue;
+
+        for (auto& dep : eltw_node.get_dependencies()) {
+            auto& fused_prims = dep.first->get_fused_primitives();
+            if (std::any_of(fused_prims.begin(), fused_prims.end(), [](const fused_primitive_desc& f_desc) {
+                return f_desc.is_type<swiglu>();
+            })) {
+                GPU_DEBUG_TRACE_DETAIL << "Skip fusing " << eltw_node.id() << " to " << dep.first->id() << " because "
+                                       << dep.first->id() << " has fused swiglu." << std::endl;
+                continue;
+            }
+        }
 
         auto is_3d_fully_connected = [](program_node& node) {
             if (!node.is_type<fully_connected>())
@@ -313,6 +371,10 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
         if (replace_candidate.is_type<convolution>()) {
             auto& conv = replace_candidate.as<convolution>();
             auto desc = conv.get_primitive();
+            // XXX: deformable convolution does not support bias fusing at this moment.
+            // It is just not tested and deformable_mode value is not properly handled below.
+            if (desc->deformable_mode)
+                continue;
             primitive_id biases = bias_name;
 
             // If the primitive has biases, then we try to combine the values, or do nothing and keep as fused sum.
@@ -341,7 +403,8 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
                                                                      desc->padding_begin,
                                                                      desc->padding_end,
                                                                      desc->grouped_weights_shape,
-                                                                     conv.get_output_layout().data_type);
+                                                                     conv.get_output_layout().data_type,
+                                                                     desc->auto_pad);
 
             // Copy transposed flag to new prim as convolution node might be produced by deconv -> conv replacement before this pass
             conv_with_bias_prim->transposed = desc->transposed;
@@ -377,6 +440,9 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
                                                                          deconv.get_output_layout().get_tensor(),
                                                                          desc->grouped_weights_shape);
 
+            deconv_with_bias_prim->pads_begin = desc->pads_begin;
+            deconv_with_bias_prim->pads_end = desc->pads_end;
+            deconv_with_bias_prim->out_padding = desc->out_padding;
             auto& new_deconv_node = p.get_or_create(deconv_with_bias_prim);
             fuse_bias_f(deconv, new_deconv_node, bias_node, eltw_node);
         } else if (replace_candidate.is_type<fully_connected>()) {
@@ -401,7 +467,8 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
                                                                        desc->weights,
                                                                        bias_name,
                                                                        fc.get_output_layout().data_type,
-                                                                       desc->input_size);
+                                                                       desc->input_size,
+                                                                       desc->weights_rank);
 
             if (desc->compressed_weights) {
                 fc_with_bias_prim->compressed_weights = true;
@@ -410,7 +477,9 @@ void prepare_primitive_fusing::fuse_bias(program &p) {
                 if (desc->decompression_zero_point_scalar.has_value())
                     fc_with_bias_prim->decompression_zero_point_scalar = desc->decompression_zero_point_scalar.value();
                 fc_with_bias_prim->activation_scale = desc->activation_scale;
+                fc_with_bias_prim->activation_zero_point = desc->activation_zero_point;
                 fc_with_bias_prim->dynamic_quantized_activation = desc->dynamic_quantized_activation;
+                fc_with_bias_prim->dynamic_quantized_activation_zp = desc->dynamic_quantized_activation_zp;
             }
             auto& new_fc_node = p.get_or_create(fc_with_bias_prim);
             fuse_bias_f(fc, new_fc_node, bias_node, eltw_node);
@@ -491,6 +560,13 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
         };
 
         auto fc_supports_fusings = [&](fully_connected_node& node) -> bool {
+            auto& fused_prims = node.get_fused_primitives();
+            if (std::any_of(fused_prims.begin(), fused_prims.end(), [](const fused_primitive_desc& f_desc) {
+                    return f_desc.is_type<swiglu>();
+                })) {
+                GPU_DEBUG_TRACE_DETAIL << node.id() << " has fused swiglu. Skip fusing more primitives" << std::endl;
+                return false;
+            }
             if (lo.has_all_enabled_onednn_impls_optimization_attribute() &&
                 lo.get_preferred_impl_type(node, format::any /*dummy*/) == impl_types::onednn) {
                 return true;
@@ -674,6 +750,7 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                     // prelu fusion is not implemented in oneDNN3.1 (CVS-108233)
                     return;
                 }
+
                 // Activation should not be fused if oneDNN does NOT support it
                 if (lo.is_primitive_implemented_for_onednn(input))  {
                     #ifdef ENABLE_ONEDNN_FOR_GPU
@@ -697,6 +774,8 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
             should_fuse |= input.is_type<resample>();
 
             should_fuse |= input.is_type<mvn>();
+
+            should_fuse |= input.is_type<rms>();
 
             should_fuse |= input.is_type<group_normalization>();
 
@@ -814,7 +893,15 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
 
             should_fuse |= input_data.is_type<pooling>() && quantize_node.get_scale_shift_opt();
 
-            should_fuse |= input_data.is_type<fully_connected>() && quantize_node.get_scale_shift_opt();
+            if (input_data.is_type<fully_connected>()) {
+                // Do not allow quantization fusion
+                auto& fc = input_data.as<fully_connected>();
+                auto desc = fc.get_primitive();
+                // WA: OneDNN weight-compressed dyn-quan matmul does not support fusion with quantization
+                auto fc_in_dt = fc.get_input_layout(0).data_type;
+                bool is_onednn_compressed_weights_dyn_quan = supports_immad && desc->compressed_weights && data_type_traits::is_i8_u8(fc_in_dt);
+                should_fuse |= !is_onednn_compressed_weights_dyn_quan && quantize_node.get_scale_shift_opt();
+            }
 
             should_fuse |= input_data.is_type<lrn>() && quantize_node.get_scale_shift_opt();
 
@@ -898,6 +985,7 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                                       (parents[i].first->is_type<mvn>() &&
                                        mvn_supports_fusings(parents[i].first->as<mvn>())) ||
                                       (parents[i].first->is_type<group_normalization>()) ||
+                                      (parents[i].first->is_type<rms>()) ||
                                       (parents[i].first->is_type<deconvolution>()) ||
                                       (parents[i].first->is_type<permute>()) ||
                                       (parents[i].first->is_type<resample>()) ||
@@ -1071,8 +1159,7 @@ void prepare_primitive_fusing::fuse_simple_primitives(program &p) {
                 auto eltw_in_size = peer_node->get_output_layout();
                 if (eltw_in_size.is_dynamic()
                     // this whitelist condition is temporarily and to be relaxed soon.
-                    && !fused_node->is_type<fully_connected>()
-                    && !fused_node->is_type<gemm>())
+                    && !fused_node->is_type<fully_connected>())
                     return;
             }
             if (parent1.first->is_type<convolution>() && !conv_supports_fusings(parent1.first->as<convolution>()))

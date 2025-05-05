@@ -15,13 +15,7 @@ Performance Information F.A.Q.
 
 .. dropdown:: Where can I find the models used in the performance benchmarks?
 
-   All models used are included in the GitHub repository of
-   :doc:`Open Model Zoo <../../documentation/legacy-features/model-zoo>`.
-
-   .. important::
-
-      Due to the deprecation of Open Model Zoo, models in the OpenVINO IR format are now
-      published on `Hugging Face <https://huggingface.co/OpenVINO>`__.
+   All models used are published on `Hugging Face <https://huggingface.co/OpenVINO>`__.
 
 .. dropdown:: Will there be any new models added to the list used for benchmarking?
 
@@ -33,9 +27,9 @@ Performance Information F.A.Q.
 
    All of the performance benchmarks on traditional network models are generated using the
    open-source tool within the Intel® Distribution of OpenVINO™ toolkit
-   called :doc:`benchmark_app <../../learn-openvino/openvino-samples/benchmark-tool>`.
+   called :doc:`benchmark_app <../../get-started/learn-openvino/openvino-samples/benchmark-tool>`.
 
-   For diffusers (Stable-Diffusion) and foundational models (aka LLMs) please use the OpenVINO GenAI 
+   For diffusers (Stable-Diffusion) and foundational models (aka LLMs) please use the OpenVINO GenAI
    opensource repo `OpenVINO GenAI tools/llm_bench <https://github.com/openvinotoolkit/openvino.genai/tree/master/tools/llm_bench>`__
 
    For a simple instruction on testing performance, see the :doc:`Getting Performance Numbers Guide <getting-performance-numbers>`.
@@ -53,11 +47,19 @@ Performance Information F.A.Q.
         - Public Network
         - Task
         - Input Size
-      * - `chatGLM4-9B <https://huggingface.co/THUDM/glm-4-9b-chat/tree/main>`__
+      * - `DeepSeek-R1-Distill-Llama-8B <https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Llama-8B>`__
+        - DeepSeek, HF
+        - Auto regressive language
+        - 128K
+      * - `DeepSeek-R1-Distill-Qwen-1.5B <https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B>`__
+        - DeepSeek, HF
+        - Auto regressive language
+        - 128K
+      * - `GLM4-9B-chat <https://huggingface.co/THUDM/glm-4-9b-chat/tree/main>`__
         - THUDM
         - Transformer
         - 128K
-      * - `Gemma-2-9B <https://huggingface.co/google/gemma-2-9b-it>`__
+      * - `Gemma-2-9B-it <https://huggingface.co/google/gemma-2-9b-it>`__
         - Hugginface
         - Text-To-Text Decoder-only
         - 8K
@@ -65,23 +67,27 @@ Performance Information F.A.Q.
         - Meta AI
         - Auto regressive language
         - 4K
-      * - `Llama-3-8b <https://www.llama.com/>`__
-        - Meta AI
-        - Auto regressive language
-        - 8K
-      * - `Llama-3.2-3B <https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct>`__
+      * - `Llama-3.2-3B-Instruct <https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct>`__
         - Meta AI
         - Auto regressive language
         - 128K
-      * - `Mistral-7b-V0.1 <https://huggingface.co/mistralai/Mistral-7B-v0.1>`__
+      * - `Mistral-7b-Instruct-V0.3 <https://huggingface.co/mistralai/Mistral-7B-v0.3>`__
         - Mistral AI
         - Auto regressive language
-        - 4096
-      * - `Phi3-4k-mini <https://huggingface.co/microsoft/Phi-3-mini-4k-instruct>`__
+        - 32K
+      * - `Phi3-4k-mini-Instruct <https://huggingface.co/microsoft/Phi-3-mini-4k-instruct>`__
         - Huggingface
         - Auto regressive language
         - 4096
-      * - `Qwen-2-7B <https://huggingface.co/Qwen/Qwen2-7B>`__
+      * - `Phi4-mini-Instruct <https://huggingface.co/microsoft/Phi-4-mini-instruct>`__
+        - Huggingface
+        - Auto regressive language
+        - 4096
+      * - `Qwen-2-VL-7B-instruct <https://huggingface.co/Qwen/Qwen2-VL-7B-instruct>`__
+        - Huggingface
+        - Auto regressive language
+        - 128K
+      * - `Qwen-2.5-7B-Instruct <https://huggingface.co/Qwen/Qwen2.5-7B-Instruct>`__
         - Huggingface
         - Auto regressive language
         - 128K
@@ -89,18 +95,18 @@ Performance Information F.A.Q.
         - Hugginface
         - Latent Diffusion Model
         - 77
+      * - `FLUX.1-schnell <https://huggingface.co/black-forest-labs/FLUX.1-schnell>`__
+        - Hugginface
+        - Latent Adversarial Diffusion Distillation Model
+        - 256
       * - `bert-base-cased <https://github.com/PaddlePaddle/PaddleNLP/tree/v2.1.1>`__
         - BERT
         - question / answer
         - 128
-      * - `efficientdet-d0 <https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/efficientdet-d0-tf>`__
-        - Efficientdet
-        - classification
-        - 512x512
-      * - `mask_rcnn_resnet50_atrous_coco <https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/mask_rcnn_resnet50_atrous_coco>`__
-        - Mask R-CNN ResNet 50 Atrous
+      * - `Detectron-V2 <https://huggingface.co/kalinkov/Detectron2_FasterRCNN_R50_FPN_InsectDetection/tree/main>`__
+        - Detectron-V2
         - object instance segmentation
-        - 800x1365
+        - 800x800
       * - `mobilenet-v2 <https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/mobilenet-v2-pytorch>`__
         - Mobilenet V2 PyTorch
         - classification
@@ -109,25 +115,20 @@ Performance Information F.A.Q.
         - ResNet-50_v1_ILSVRC-2012
         - classification
         - 224x224
-      * - `ssd-mobilenet-v1-coco <https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/ssd_mobilenet_v1_coco>`__
-        - ssd-mobilenet-V1-coco onnx model
-        - object detection
-        - 300x300
       * - `ssd-resnet34-1200-onnx <https://github.com/openvinotoolkit/open_model_zoo/tree/master/models/public/ssd-resnet34-1200-onnx>`__
         - ssd-resnet34 onnx model
         - object detection
         - 1200x1200
-      * - `yolov8n <https://github.com/ultralytics/ultralytics>`__
-        - Yolov8nano
+      * - `yolov11 <https://github.com/ultralytics/ultralytics>`__
+        - Yolov11
         - object detection
-        - 608x608
-
+        - 640x640
 
 .. dropdown:: Where can I purchase the specific hardware used in the benchmarking?
 
    Intel partners with vendors all over the world. For a list of Hardware Manufacturers, see the
    `Intel® AI: In Production Partners & Solutions Catalog <https://www.intel.com/content/www/us/en/internet-of-things/ai-in-production/partners-solutions-catalog.html>`__.
-   For more details, see the :doc:`Supported Devices <../compatibility-and-support/supported-devices>` article.
+   For more details, see the :doc:`Supported Devices <../../documentation/compatibility-and-support/supported-devices>` article.
 
 
 .. dropdown:: How can I optimize my models for better performance or accuracy?
